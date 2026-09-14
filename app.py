@@ -73,12 +73,23 @@ def save_database_name(database_name):
     save_config(config)
 
 
+# ===========================
+# CREDENCIALES NEON.TECH (CLOUD)
+# ===========================
+NEON_HOST = "ep-delicate-term-b4zszln3-pooler.c-6.us-east-2.aws.neon.tech"
+NEON_DATABASE = "neondb"
+NEON_USER = "neondb_owner"
+NEON_PASSWORD = "npg_je9vgbuEIcJ5"
+NEON_PORT = 5432
+NEON_SSLMODE = "require"
+
 DB_CONFIG = {
-    "host": "localhost",
-    "database": load_database_name(),
-    "user": "postgres",
-    "password": "1234",
-    "port": 5432,
+    "host": NEON_HOST,
+    "database": NEON_DATABASE,
+    "user": NEON_USER,
+    "password": NEON_PASSWORD,
+    "port": NEON_PORT,
+    "sslmode": NEON_SSLMODE,
 }
 
 scheduler = BackgroundScheduler()
@@ -135,6 +146,8 @@ def find_postgres_tool(tool_name):
 def postgres_env():
     env = os.environ.copy()
     env["PGPASSWORD"] = DB_CONFIG["password"]
+    # Neon.tech requiere SSL
+    env["PGSSLMODE"] = DB_CONFIG.get("sslmode", "require")
     return env
 
 
@@ -143,7 +156,7 @@ def postgres_env():
 # ===========================
 
 def get_db_connection(database=None):
-    """Obtener conexion a PostgreSQL."""
+    """Obtener conexion a PostgreSQL / Neon.tech (cloud)."""
     try:
         config = DB_CONFIG.copy()
         if database:
@@ -196,62 +209,29 @@ def get_database_info():
 
 
 def get_available_databases():
-    """Obtener lista de bases de datos disponibles en PostgreSQL."""
-    try:
-        conn = psycopg2.connect(
-            host=DB_CONFIG["host"],
-            database="postgres",
-            user=DB_CONFIG["user"],
-            password=DB_CONFIG["password"],
-            port=DB_CONFIG["port"],
-        )
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT datname 
-            FROM pg_database 
-            WHERE datistemplate = false 
-            AND datname NOT IN ('postgres')
-            ORDER BY datname;
-            """
-        )
-        databases = [row[0] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
-        return databases
-    except Exception as e:
-        print(f"Error obteniendo bases de datos: {e}")
-        return []
+    """Obtener lista de bases de datos disponibles.
+    En Neon.tech (cloud) solo existe la base de datos configurada.
+    """
+    # Neon.tech es una BD gestionada: no se permite conectar a 'postgres'
+    # ni crear/listar otras bases de datos. Solo existe neondb.
+    return [DB_CONFIG["database"]]
 
 
 def switch_database(new_database_name):
-    """Cambiar a una base de datos diferente."""
-    try:
-        # Verificar que la base de datos existe
-        available_dbs = get_available_databases()
-        if new_database_name not in available_dbs:
-            return False, f"La base de datos '{new_database_name}' no existe en PostgreSQL"
-        
-        # Intentar conectar a la nueva base de datos
-        test_conn = psycopg2.connect(
-            host=DB_CONFIG["host"],
-            database=new_database_name,
-            user=DB_CONFIG["user"],
-            password=DB_CONFIG["password"],
-            port=DB_CONFIG["port"],
+    """Cambiar a una base de datos diferente.
+    En Neon.tech solo existe una base de datos (neondb).
+    """
+    neon_db = DB_CONFIG["database"]
+    if new_database_name != neon_db:
+        return False, (
+            f"En Neon.tech solo está disponible la base de datos '{neon_db}'. "
+            f"No se puede cambiar a '{new_database_name}'."
         )
-        test_conn.close()
-        
-        # Actualizar configuración
-        DB_CONFIG["database"] = new_database_name
-        
-        config = load_config()
-        config["current_database"] = new_database_name
-        save_config(config)
-        
-        return True, f"Cambiado a la base de datos '{new_database_name}'"
-    except Exception as e:
-        return False, f"Error al cambiar de base de datos: {str(e)}"
+    # Ya estamos en la única BD disponible
+    config = load_config()
+    config["current_database"] = neon_db
+    save_config(config)
+    return True, f"Base de datos activa: '{neon_db}'"
 
 
 # ===========================
@@ -259,7 +239,7 @@ def switch_database(new_database_name):
 # ===========================
 
 def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
-    """Realizar backup y reemplazar el archivo anterior con el mismo nombre."""
+    """Realizar backup contra Neon.tech y reemplazar el archivo anterior."""
     backup_filename = normalize_backup_filename(filename)
     backup_file = get_backup_path(backup_filename)
     temp_file = backup_file.with_name(f"{backup_file.stem}.tmp.sql")
@@ -272,21 +252,16 @@ def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
 
         command = [
             pg_dump_path,
-            "-h",
-            DB_CONFIG["host"],
-            "-p",
-            str(DB_CONFIG["port"]),
-            "-U",
-            DB_CONFIG["user"],
-            "-d",
-            DB_CONFIG["database"],
-            "-f",
-            str(temp_file),
+            "-h", DB_CONFIG["host"],
+            "-p", str(DB_CONFIG["port"]),
+            "-U", DB_CONFIG["user"],
+            "-d", DB_CONFIG["database"],
+            "-f", str(temp_file),
             "--no-owner",
             "--no-privileges",
         ]
 
-        print(f"[DEBUG] Ejecutando backup de {DB_CONFIG['database']} en {backup_file}")
+        print(f"[DEBUG] Ejecutando backup de {DB_CONFIG['database']} (Neon.tech) en {backup_file}")
         result = subprocess.run(
             command,
             env=postgres_env(),
@@ -309,8 +284,6 @@ def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
         config["backup_size"] = backup_size
         config["backup_filename"] = backup_filename
         config["backup_file"] = str(backup_file)
-        # Guardar la base de origen permite restaurarla aunque haya sido
-        # eliminada de PostgreSQL o aunque el nombre del archivo sea distinto.
         config["backup_database"] = DB_CONFIG["database"]
         config["current_database"] = DB_CONFIG["database"]
         save_config(config)
@@ -328,88 +301,85 @@ def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
 
 
 def restore_backup(filename=None, new_database_name=None):
-    """Restaurar manualmente un backup en su base de datos de origen."""
+    """Restaurar manualmente un backup en Neon.tech.
+    
+    En Neon.tech no se puede hacer DROP/CREATE DATABASE.
+    En su lugar:
+    1. Se hace TRUNCATE de todas las tablas existentes (CASCADE).
+    2. Se ejecuta el archivo SQL del backup con psql contra Neon.
+    """
     config = load_config()
     backup_filename = normalize_backup_filename(
         filename or config.get("backup_filename") or DEFAULT_BACKUP_FILENAME
     )
     backup_file = get_backup_path(backup_filename)
 
-    # Nunca asumir que el nombre del archivo es el nombre de la BD.
-    # El backup guarda este dato; el fallback mantiene compatibilidad con copias antiguas.
-    is_last_backup = backup_filename == normalize_backup_filename(
-        config.get("backup_filename") or DEFAULT_BACKUP_FILENAME
-    )
-    source_database = config.get("backup_database") if is_last_backup else None
-    target_database = str(
-        new_database_name or source_database
-        or config.get("current_database") or DB_CONFIG["database"]
-    ).strip()
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", target_database):
-        return False, "El nombre de la base de datos de destino no es válido."
-    if target_database.lower() == "postgres":
-        return False, "No se puede reemplazar la base de datos administrativa 'postgres'."
+    # En Neon siempre restauramos en la misma BD
+    target_database = DB_CONFIG["database"]
 
-    # Validación mejorada: verificar que el archivo existe
+    # Validar que el archivo existe
     if not backup_file.exists():
-        return False, f"❌ Error: El archivo de backup '{backup_filename}.sql' no existe en {BACKUP_DIR}. Verifica el nombre e intenta nuevamente."
+        return False, (
+            f"❌ Error: El archivo de backup '{backup_filename}.sql' no existe en {BACKUP_DIR}. "
+            f"Verifica el nombre e intenta nuevamente."
+        )
 
-    # Validación adicional: verificar que el archivo tiene contenido
+    # Validar que el archivo tiene contenido
     try:
         file_size = backup_file.stat().st_size
         if file_size == 0:
-            return False, f"❌ Error: El archivo '{backup_filename}.sql' está vacío. No se puede restaurar un backup sin datos."
+            return False, (
+                f"❌ Error: El archivo '{backup_filename}.sql' está vacío. "
+                f"No se puede restaurar un backup sin datos."
+            )
     except Exception as e:
         return False, f"❌ Error al verificar el archivo '{backup_filename}.sql': {str(e)}"
 
     try:
         psql_path = find_postgres_tool("psql")
 
-        conn = psycopg2.connect(
-            host=DB_CONFIG["host"],
-            database="postgres",
-            user=DB_CONFIG["user"],
-            password=DB_CONFIG["password"],
-            port=DB_CONFIG["port"],
-        )
+        # Paso 1: Truncar todas las tablas en Neon para limpiar datos actuales
+        print(f"[DEBUG] Truncando tablas en Neon.tech ({target_database})...")
+        conn = get_db_connection()
+        if not conn:
+            return False, "No se pudo conectar a Neon.tech para truncar las tablas."
+
         conn.autocommit = True
         cur = conn.cursor()
 
-        # Terminar todas las conexiones a la BD si existe
+        # Obtener todas las tablas del schema public
         cur.execute(
             """
-            SELECT pg_terminate_backend(pid)
-            FROM pg_stat_activity
-            WHERE datname = %s
-              AND pid <> pg_backend_pid();
-            """,
-            (target_database,),
+            SELECT tablename FROM pg_tables
+            WHERE schemaname = 'public'
+            ORDER BY tablename;
+            """
         )
-        
-        # Eliminar y crear la nueva base de datos
-        cur.execute(sql.SQL("DROP DATABASE IF EXISTS {};").format(sql.Identifier(target_database)))
-        cur.execute(sql.SQL("CREATE DATABASE {};").format(sql.Identifier(target_database)))
+        tables = [row[0] for row in cur.fetchall()]
+
+        if tables:
+            # TRUNCATE CASCADE elimina los datos respetando las FK
+            tables_sql = ", ".join(
+                f'"{t}"' for t in tables
+            )
+            cur.execute(f"TRUNCATE TABLE {tables_sql} RESTART IDENTITY CASCADE;")
+            print(f"[DEBUG] Tablas truncadas: {tables}")
 
         cur.close()
         conn.close()
 
+        # Paso 2: Restaurar con psql contra Neon.tech (SSL)
         command = [
             psql_path,
-            "-h",
-            DB_CONFIG["host"],
-            "-p",
-            str(DB_CONFIG["port"]),
-            "-U",
-            DB_CONFIG["user"],
-            "-d",
-            target_database,
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-f",
-            str(backup_file),
+            "-h", DB_CONFIG["host"],
+            "-p", str(DB_CONFIG["port"]),
+            "-U", DB_CONFIG["user"],
+            "-d", target_database,
+            "-v", "ON_ERROR_STOP=0",  # Continuar ante errores menores (duplicados, etc.)
+            "-f", str(backup_file),
         ]
 
-        print(f"[DEBUG] Restaurando {backup_file} en {target_database}")
+        print(f"[DEBUG] Restaurando {backup_file} en Neon.tech ({target_database})")
         result = subprocess.run(
             command,
             env=postgres_env(),
@@ -422,9 +392,6 @@ def restore_backup(filename=None, new_database_name=None):
             print(f"Error en restauracion: {error_message}")
             return False, error_message
 
-        # ACTUALIZAR el sistema para usar la nueva base de datos
-        DB_CONFIG["database"] = target_database
-
         config["current_database"] = target_database
         config["backup_filename"] = backup_filename
         config["backup_file"] = str(backup_file)
@@ -432,7 +399,7 @@ def restore_backup(filename=None, new_database_name=None):
         save_config(config)
 
         message = (
-            f"Base de datos '{target_database}' creada y restaurada con "
+            f"Base de datos '{target_database}' (Neon.tech) restaurada con "
             f"'{backup_filename}.sql' exitosamente"
         )
         print(message)
@@ -1099,25 +1066,122 @@ def update_config():
 
 
 # ===========================
+# INICIALIZACION DE ESQUEMA
+# ===========================
+
+def initialize_schema():
+    """Crear tablas e insertar datos de ejemplo si no existen (primera ejecucion).
+    Se ejecuta automaticamente al arrancar el backend.
+    """
+    print("Verificando esquema de base de datos en Neon.tech...")
+    conn = get_db_connection()
+    if not conn:
+        print("[ERROR] No se pudo conectar a Neon.tech para inicializar el esquema.")
+        return
+
+    try:
+        cur = conn.cursor()
+
+        # Crear tablas si no existen
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS productos (
+                id_producto SERIAL PRIMARY KEY,
+                nombre VARCHAR(255) NOT NULL,
+                precio DECIMAL(10, 2) NOT NULL,
+                stock INTEGER NOT NULL
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clientes (
+                id_cliente SERIAL PRIMARY KEY,
+                nombre VARCHAR(100) NOT NULL,
+                apellido VARCHAR(100) NOT NULL,
+                email VARCHAR(255) UNIQUE
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pedidos (
+                id_pedido SERIAL PRIMARY KEY,
+                id_cliente INTEGER NOT NULL,
+                id_producto INTEGER NOT NULL,
+                cantidad INTEGER NOT NULL,
+                fecha_pedido DATE NOT NULL,
+                FOREIGN KEY (id_cliente) REFERENCES clientes(id_cliente),
+                FOREIGN KEY (id_producto) REFERENCES productos(id_producto)
+            );
+        """)
+
+        print("[OK] Tablas verificadas/creadas correctamente.")
+
+        # Insertar datos de ejemplo solo si las tablas estan vacias
+        cur.execute("SELECT COUNT(*) FROM productos;")
+        if cur.fetchone()[0] == 0:
+            cur.execute("""
+                INSERT INTO productos (nombre, precio, stock) VALUES
+                ('Laptop', 850.00, 20),
+                ('Raton Inalambrico', 25.50, 100),
+                ('Teclado Mecanico', 75.00, 50);
+            """)
+            print("[OK] Datos de ejemplo insertados en 'productos'.")
+
+        cur.execute("SELECT COUNT(*) FROM clientes;")
+        if cur.fetchone()[0] == 0:
+            cur.execute("""
+                INSERT INTO clientes (nombre, apellido, email) VALUES
+                ('Ana', 'Garcia', 'ana.garcia@gmail.com'),
+                ('Luis', 'Rodriguez', 'luis.rodriguez@gmail.com');
+            """)
+            print("[OK] Datos de ejemplo insertados en 'clientes'.")
+
+        cur.execute("SELECT COUNT(*) FROM pedidos;")
+        if cur.fetchone()[0] == 0:
+            cur.execute("""
+                INSERT INTO pedidos (id_cliente, id_producto, cantidad, fecha_pedido) VALUES
+                (1, 1, 1, '2024-05-20'),
+                (1, 2, 2, '2024-05-20'),
+                (2, 3, 1, '2024-05-21');
+            """)
+            print("[OK] Datos de ejemplo insertados en 'pedidos'.")
+
+        conn.commit()
+        print("[OK] Esquema inicializado correctamente en Neon.tech.")
+    except Exception as e:
+        conn.rollback()
+        print(f"[ERROR] Error inicializando esquema: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ===========================
 # INICIALIZACION
 # ===========================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Sistema de Backups Automaticos - PostgreSQL")
+    print("Sistema de Backups Automaticos - Neon.tech (Cloud)")
     print("=" * 60)
-    print(f"Directorio de backups: {BACKUP_DIR}")
-    print(f"Base de datos: {DB_CONFIG['database']}")
+    print(f"Host:           {DB_CONFIG['host']}")
+    print(f"Base de datos:  {DB_CONFIG['database']}")
+    print(f"Usuario:        {DB_CONFIG['user']}")
+    print(f"SSL:            {DB_CONFIG.get('sslmode', 'require')}")
+    print(f"Backups en:     {BACKUP_DIR}")
     print("Servidor Flask: http://localhost:5000")
     print("=" * 60)
 
+    # Verificar conexion a Neon.tech
     conn = get_db_connection()
     if conn:
-        print("Conexion a PostgreSQL exitosa")
+        print("[OK] Conexion a Neon.tech exitosa")
         conn.close()
+
+        # Inicializar esquema (crea tablas e inserta datos si es la primera vez)
+        initialize_schema()
     else:
-        print("Error al conectar con PostgreSQL")
-        print("Verifica que PostgreSQL este corriendo y la clave sea 1234")
+        print("[ERROR] Error al conectar con Neon.tech")
+        print("Verifica tu conexion a internet y las credenciales.")
 
     print("=" * 60)
     print("Presiona Ctrl+C para detener el servidor")

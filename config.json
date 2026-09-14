@@ -1,14 +1,14 @@
 {
     "backup_interval_minutes": null,
-    "last_backup_time": "2026-09-10T19:38:22.270750",
-    "backup_size": 5829,
-    "backup_filename": "producto_backup",
-    "backup_database": "producto_backup",
-    "current_database": "producto_backup",
-    "backup_file": "D:\\BACKUP\\producto_backup.sql",
+    "last_backup_time": null,
+    "backup_size": 0,
+    "backup_filename": "neondb_backup",
+    "backup_database": "neondb",
+    "current_database": "neondb",
+    "backup_file": "D:\\BACKUP\\neondb_backup.sql",
     "backup_interval_seconds": 10,
     "backup_interval_hours": null,
     "backup_interval_days": null,
     "backup_interval_weeks": null,
-    "last_restore_time": "2026-09-10T19:38:51.685063"
+    "last_restore_time": null
 }
