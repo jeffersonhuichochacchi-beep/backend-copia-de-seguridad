@@ -10,6 +10,8 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 import json
+import threading
+import b2_service
 
 app = Flask(__name__)
 CORS(app)
@@ -238,59 +240,246 @@ def switch_database(new_database_name):
 # FUNCIONES DE BACKUP
 # ===========================
 
+def generate_native_sql_dump(backup_file: Path, temp_file: Path) -> bool:
+    """Genera un volcado SQL completo de Neon.tech usando psycopg2 (sin depender de pg_dump).
+    Compatible con cualquier versión de PostgreSQL.
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise Exception("No se pudo conectar a Neon.tech para generar el backup")
+
+    cur = conn.cursor()
+    lines = []
+    lines.append("-- ========================================================")
+    lines.append(f"-- Backup Neon.tech PostgreSQL - {DB_CONFIG['database']}")
+    lines.append(f"-- Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"-- Host: {DB_CONFIG['host']}")
+    lines.append("-- ========================================================\n")
+    lines.append("SET statement_timeout = 0;")
+    lines.append("SET client_encoding = 'UTF8';")
+    lines.append("SET standard_conforming_strings = on;\n")
+
+    # Obtener tablas base
+    cur.execute("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name;
+    """)
+    tables = [r[0] for r in cur.fetchall()]
+
+    # Definiciones de tablas
+    for table in tables:
+        cur.execute("""
+            SELECT column_name, data_type, character_maximum_length,
+                   numeric_precision, numeric_scale, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            ORDER BY ordinal_position;
+        """, (table,))
+        columns = cur.fetchall()
+        col_defs = []
+        for col_name, data_type, char_len, num_prec, num_scale, is_nullable, col_default in columns:
+            type_str = data_type.upper()
+            if data_type in ('character varying', 'varchar') and char_len:
+                type_str = f"VARCHAR({char_len})"
+            elif data_type == 'numeric' and num_prec:
+                type_str = f"NUMERIC({num_prec}, {num_scale})" if num_scale else f"NUMERIC({num_prec})"
+            if col_default and 'nextval' in col_default and 'seq' in col_default:
+                type_str = "BIGSERIAL" if data_type == 'bigint' else "SERIAL"
+                col_default = None
+            part = f'"{col_name}" {type_str}'
+            if is_nullable == 'NO':
+                part += " NOT NULL"
+            if col_default:
+                part += f" DEFAULT {col_default}"
+            col_defs.append(part)
+
+        # Clave primaria
+        cur.execute("""
+            SELECT kcu.column_name FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = %s
+            ORDER BY kcu.ordinal_position;
+        """, (table,))
+        pk_cols = [r[0] for r in cur.fetchall()]
+        if pk_cols:
+            col_defs.append(f'PRIMARY KEY ({", ".join(pk_cols)})')
+
+        lines.append(f'-- Table: {table}')
+        lines.append(f'CREATE TABLE IF NOT EXISTS "{table}" (\n    ' + ",\n    ".join(col_defs) + "\n);")
+        lines.append("")
+
+    # Datos de cada tabla
+    for table in tables:
+        cur.execute(sql.SQL('SELECT * FROM {}').format(sql.Identifier(table)))
+        rows = cur.fetchall()
+        if rows:
+            lines.append(f"-- Data for {table} ({len(rows)} rows)")
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                ORDER BY ordinal_position;
+            """, (table,))
+            col_names = [r[0] for r in cur.fetchall()]
+            cols_str = ", ".join(f'"{c}"' for c in col_names)
+            for row in rows:
+                val_strs = []
+                for val in row:
+                    if val is None:
+                        val_strs.append("NULL")
+                    elif isinstance(val, bool):
+                        val_strs.append("TRUE" if val else "FALSE")
+                    elif isinstance(val, (int, float)):
+                        val_strs.append(str(val))
+                    else:
+                        escaped = str(val).replace("'", "''")
+                        val_strs.append(f"'{escaped}'")
+                lines.append(f'INSERT INTO "{table}" ({cols_str}) VALUES ({", ".join(val_strs)});')
+            lines.append("")
+
+    # Llaves foráneas
+    fk_statements = []
+    for table in tables:
+        cur.execute("""
+            SELECT tc.constraint_name, kcu.column_name,
+                   ccu.table_name AS foreign_table, ccu.column_name AS foreign_col
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = %s;
+        """, (table,))
+        for fk_name, col_name, f_table, f_col in cur.fetchall():
+            fk_statements.append(
+                f'DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = \'{fk_name}\') THEN '
+                f'ALTER TABLE "{table}" ADD CONSTRAINT "{fk_name}" FOREIGN KEY ("{col_name}") REFERENCES "{f_table}" ("{f_col}"); '
+                f'END IF; END $$;'
+            )
+    if fk_statements:
+        lines.append("-- Foreign Keys")
+        lines.extend(fk_statements)
+        lines.append("")
+
+    # Reinicio de secuencias
+    lines.append("-- Reset Sequences")
+    for table in tables:
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s AND column_default LIKE 'nextval%%'
+        """, (table,))
+        for (sc,) in cur.fetchall():
+            lines.append(
+                f"SELECT setval(pg_get_serial_sequence('\"{ table}\"', '{sc}'), "
+                f"COALESCE((SELECT MAX(\"{sc}\") FROM \"{table}\"), 1), "
+                f"(SELECT COUNT(*) > 0 FROM \"{table}\"));"
+            )
+    lines.append("")
+
+    content = "\n".join(lines)
+    with open(str(temp_file), "w", encoding="utf-8") as f:
+        f.write(content)
+
+    cur.close()
+    conn.close()
+    return True
+
+
 def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
-    """Realizar backup contra Neon.tech y reemplazar el archivo anterior."""
+    """Realizar backup contra Neon.tech, guardarlo localmente y subirlo a Backblaze B2."""
     backup_filename = normalize_backup_filename(filename)
     backup_file = get_backup_path(backup_filename)
     temp_file = backup_file.with_name(f"{backup_file.stem}.tmp.sql")
 
     try:
-        pg_dump_path = find_postgres_tool("pg_dump")
-
         if temp_file.exists():
             temp_file.unlink()
 
-        command = [
-            pg_dump_path,
-            "-h", DB_CONFIG["host"],
-            "-p", str(DB_CONFIG["port"]),
-            "-U", DB_CONFIG["user"],
-            "-d", DB_CONFIG["database"],
-            "-f", str(temp_file),
-            "--no-owner",
-            "--no-privileges",
-        ]
+        print(f"[DEBUG] Generando backup de {DB_CONFIG['database']} (Neon.tech) -> {backup_file}")
 
-        print(f"[DEBUG] Ejecutando backup de {DB_CONFIG['database']} (Neon.tech) en {backup_file}")
-        result = subprocess.run(
-            command,
-            env=postgres_env(),
-            capture_output=True,
-            text=True,
-        )
+        # Intentar primero con pg_dump; si falla por versión, usar volcado nativo
+        try:
+            pg_dump_path = find_postgres_tool("pg_dump")
+            command = [
+                pg_dump_path,
+                "-h", DB_CONFIG["host"],
+                "-p", str(DB_CONFIG["port"]),
+                "-U", DB_CONFIG["user"],
+                "-d", DB_CONFIG["database"],
+                "-f", str(temp_file),
+                "--no-owner",
+                "--no-privileges",
+            ]
+            result = subprocess.run(
+                command,
+                env=postgres_env(),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                # Si el error es por versión incompatible, usar volcado nativo
+                stderr = result.stderr.strip()
+                if "no coincide la versión" in stderr or "version mismatch" in stderr.lower():
+                    print(f"[INFO] pg_dump versión incompatible, usando volcado nativo Python...")
+                    generate_native_sql_dump(backup_file, temp_file)
+                else:
+                    if temp_file.exists():
+                        temp_file.unlink()
+                    print(f"Error en pg_dump: {stderr}")
+                    return False, stderr
+            # Verificar que el archivo temp tiene contenido
+            if not temp_file.exists() or temp_file.stat().st_size == 0:
+                print("[INFO] pg_dump generó archivo vacío, usando volcado nativo Python...")
+                generate_native_sql_dump(backup_file, temp_file)
+        except FileNotFoundError:
+            print("[INFO] pg_dump no encontrado, usando volcado nativo Python...")
+            generate_native_sql_dump(backup_file, temp_file)
 
-        if result.returncode != 0:
-            if temp_file.exists():
-                temp_file.unlink()
-            error_message = result.stderr.strip() or "pg_dump termino con error"
-            print(f"Error en backup: {error_message}")
-            return False, error_message
+        # Mover temp a backup final
+        if temp_file.exists():
+            os.replace(temp_file, backup_file)
 
-        os.replace(temp_file, backup_file)
         backup_size = backup_file.stat().st_size if backup_file.exists() else 0
+        now_iso = datetime.now().isoformat()
 
+        # Actualizar config local
         config = load_config()
-        config["last_backup_time"] = datetime.now().isoformat()
+        config["last_backup_time"] = now_iso
         config["backup_size"] = backup_size
         config["backup_filename"] = backup_filename
         config["backup_file"] = str(backup_file)
         config["backup_database"] = DB_CONFIG["database"]
         config["current_database"] = DB_CONFIG["database"]
+
+        # Subir a Backblaze B2 en hilo separado para no bloquear el scheduler
+        def _upload_to_b2():
+            try:
+                result = b2_service.upload_file_to_b2(
+                    local_path=str(backup_file),
+                    remote_filename=f"{backup_filename}.sql",
+                )
+                config["b2_last_upload"] = result["upload_time"]
+                config["b2_file"] = result["file_name"]
+                config["b2_file_id"] = result["file_id"]
+                config["b2_status"] = "ok"
+                save_config(config)
+                print(
+                    f"[B2] Backup subido a Backblaze B2: {result['file_name']} "
+                    f"({result['size']} bytes)"
+                )
+            except Exception as b2_err:
+                config["b2_status"] = f"error: {b2_err}"
+                save_config(config)
+                print(f"[B2] Error al subir a Backblaze B2: {b2_err}")
+
         save_config(config)
+        threading.Thread(target=_upload_to_b2, daemon=True).start()
 
         print(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-            f"Backup realizado: {backup_file}"
+            f"Backup realizado: {backup_file} ({backup_size} bytes)"
         )
         return True, str(backup_file)
     except Exception as e:
@@ -300,31 +489,45 @@ def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
         return False, str(e)
 
 
-def restore_backup(filename=None, new_database_name=None):
-    """Restaurar manualmente un backup en Neon.tech.
-    
-    En Neon.tech no se puede hacer DROP/CREATE DATABASE.
-    En su lugar:
-    1. Se hace TRUNCATE de todas las tablas existentes (CASCADE).
-    2. Se ejecuta el archivo SQL del backup con psql contra Neon.
+def restore_backup(filename=None, new_database_name=None, from_b2=False):
+    """Restaurar un backup en Neon.tech.
+
+    Proceso:
+    1. Si from_b2=True o el archivo local no existe, descarga la última copia de Backblaze B2.
+    2. Hace TRUNCATE de todas las tablas existentes (CASCADE).
+    3. Ejecuta el SQL del backup con psql contra Neon.tech.
     """
     config = load_config()
     backup_filename = normalize_backup_filename(
         filename or config.get("backup_filename") or DEFAULT_BACKUP_FILENAME
     )
     backup_file = get_backup_path(backup_filename)
-
-    # En Neon siempre restauramos en la misma BD
     target_database = DB_CONFIG["database"]
+    b2_filename = f"{backup_filename}.sql"
 
-    # Validar que el archivo existe
+    # ── Intentar descargar desde Backblaze B2 si se solicita o no hay copia local ──
+    if from_b2 or not backup_file.exists():
+        print(f"[B2] Descargando '{b2_filename}' desde Backblaze B2...")
+        try:
+            b2_service.download_file_from_b2(
+                remote_filename=b2_filename,
+                target_path=str(backup_file),
+            )
+            print(f"[B2] Descarga completada: {backup_file}")
+        except Exception as b2_err:
+            if not backup_file.exists():
+                return False, (
+                    f"❌ No se encontró el backup en Backblaze B2 ni en local: {b2_err}"
+                )
+            print(f"[B2] Advertencia: no se pudo descargar desde B2, usando copia local. {b2_err}")
+
+    # ── Validar archivo local ──
     if not backup_file.exists():
         return False, (
             f"❌ Error: El archivo de backup '{backup_filename}.sql' no existe en {BACKUP_DIR}. "
             f"Verifica el nombre e intenta nuevamente."
         )
 
-    # Validar que el archivo tiene contenido
     try:
         file_size = backup_file.stat().st_size
         if file_size == 0:
@@ -338,7 +541,7 @@ def restore_backup(filename=None, new_database_name=None):
     try:
         psql_path = find_postgres_tool("psql")
 
-        # Paso 1: Truncar todas las tablas en Neon para limpiar datos actuales
+        # ── Paso 1: Truncar tablas ──
         print(f"[DEBUG] Truncando tablas en Neon.tech ({target_database})...")
         conn = get_db_connection()
         if not conn:
@@ -346,8 +549,6 @@ def restore_backup(filename=None, new_database_name=None):
 
         conn.autocommit = True
         cur = conn.cursor()
-
-        # Obtener todas las tablas del schema public
         cur.execute(
             """
             SELECT tablename FROM pg_tables
@@ -356,29 +557,23 @@ def restore_backup(filename=None, new_database_name=None):
             """
         )
         tables = [row[0] for row in cur.fetchall()]
-
         if tables:
-            # TRUNCATE CASCADE elimina los datos respetando las FK
-            tables_sql = ", ".join(
-                f'"{t}"' for t in tables
-            )
+            tables_sql = ", ".join(f'"{t}"' for t in tables)
             cur.execute(f"TRUNCATE TABLE {tables_sql} RESTART IDENTITY CASCADE;")
             print(f"[DEBUG] Tablas truncadas: {tables}")
-
         cur.close()
         conn.close()
 
-        # Paso 2: Restaurar con psql contra Neon.tech (SSL)
+        # ── Paso 2: Restaurar con psql ──
         command = [
             psql_path,
             "-h", DB_CONFIG["host"],
             "-p", str(DB_CONFIG["port"]),
             "-U", DB_CONFIG["user"],
             "-d", target_database,
-            "-v", "ON_ERROR_STOP=0",  # Continuar ante errores menores (duplicados, etc.)
+            "-v", "ON_ERROR_STOP=0",
             "-f", str(backup_file),
         ]
-
         print(f"[DEBUG] Restaurando {backup_file} en Neon.tech ({target_database})")
         result = subprocess.run(
             command,
@@ -386,7 +581,6 @@ def restore_backup(filename=None, new_database_name=None):
             capture_output=True,
             text=True,
         )
-
         if result.returncode != 0:
             error_message = result.stderr.strip() or "psql termino con error"
             print(f"Error en restauracion: {error_message}")
@@ -419,26 +613,30 @@ def get_current_backup_filename():
     return normalize_backup_filename(config.get("backup_filename", DEFAULT_BACKUP_FILENAME))
 
 
-def start_scheduler(interval_minutes=None, interval_seconds=None, interval_hours=None, 
+def start_scheduler(interval_minutes=None, interval_seconds=None, interval_hours=None,
                    interval_days=None, interval_weeks=None, backup_filename=DEFAULT_BACKUP_FILENAME):
-    """Iniciar o reconfigurar los backups automaticos."""
+    """Iniciar o reconfigurar los backups automaticos.
+
+    Al iniciar, ejecuta un primer backup de inmediato (en hilo separado)
+    y programa los sucesivos según el intervalo configurado.
+    """
     global scheduler_running, CURRENT_BACKUP_FILENAME
 
     backup_filename = normalize_backup_filename(backup_filename)
     CURRENT_BACKUP_FILENAME = backup_filename
 
     scheduler.remove_all_jobs()
-    
-    # Usar una funcion que obtenga el nombre actual del config cada vez
+
+    # Función que siempre usa el nombre más reciente del config
     def backup_with_current_name():
         current_name = get_current_backup_filename()
         return perform_backup(current_name)
-    
-    # Determinar qué unidad usar (prioridad: segundos, minutos, horas, días, semanas)
+
+    # Determinar unidad de intervalo (prioridad: segundos > minutos > horas > días > semanas)
     interval_type = "minuto(s)"
     interval_value = 1
     trigger_params = {}
-    
+
     if interval_seconds is not None and interval_seconds > 0:
         trigger_params = {"seconds": interval_seconds}
         interval_type = "segundo(s)"
@@ -465,7 +663,6 @@ def start_scheduler(interval_minutes=None, interval_seconds=None, interval_hours
         interval_value = interval_weeks
         config_key = "backup_interval_weeks"
     else:
-        # Por defecto: 1 minuto
         trigger_params = {"minutes": 1}
         interval_type = "minuto(s)"
         interval_value = 1
@@ -485,22 +682,23 @@ def start_scheduler(interval_minutes=None, interval_seconds=None, interval_hours
     scheduler_running = True
 
     config = load_config()
-    # Limpiar todos los intervalos anteriores
     config["backup_interval_seconds"] = None
     config["backup_interval_minutes"] = None
     config["backup_interval_hours"] = None
     config["backup_interval_days"] = None
     config["backup_interval_weeks"] = None
-    # Establecer solo el intervalo actual
     config[config_key] = interval_value
     config["backup_filename"] = backup_filename
     config["backup_file"] = str(get_backup_path(backup_filename))
     config["current_database"] = DB_CONFIG["database"]
     save_config(config)
 
+    # Primer backup inmediato al iniciar (en hilo para no bloquear la respuesta HTTP)
+    threading.Thread(target=backup_with_current_name, daemon=True).start()
+
     print(
         f"Scheduler iniciado: backup cada {interval_value} {interval_type} -> "
-        f"{get_backup_path(backup_filename)}"
+        f"{get_backup_path(backup_filename)} + Backblaze B2"
     )
     return True
 
@@ -898,26 +1096,47 @@ def manual_backup():
 def restore_backup_route():
     data = request.get_json() or {}
     config = load_config()
-    # Sin nombre explícito se restaura la última copia configurada.
     backup_filename = normalize_backup_filename(
         data.get("backup_filename") or config.get("backup_filename") or DEFAULT_BACKUP_FILENAME
     )
-    new_database_name = data.get("new_database_name")  # Opcional
+    new_database_name = data.get("new_database_name")
+    # Si el archivo local no existe, intentar descargarlo desde B2 automáticamente
+    backup_file = get_backup_path(backup_filename)
+    from_b2 = data.get("from_b2", False) or not backup_file.exists()
 
-    success, message = restore_backup(backup_filename, new_database_name)
+    success, message = restore_backup(backup_filename, new_database_name, from_b2=from_b2)
     if success:
+        updated_info = {}
+        try:
+            db_info = get_database_info()
+            if db_info:
+                updated_info = {"stats": db_info["stats"], "tables": db_info["tables"]}
+        except Exception:
+            pass
         return jsonify(
             {
                 "success": True,
                 "message": message,
                 "database_name": DB_CONFIG["database"],
                 "backup_filename": backup_filename,
-                "backup_file": str(get_backup_path(backup_filename)),
+                "backup_file": str(backup_file),
                 "timestamp": datetime.now().isoformat(),
+                **updated_info,
             }
         )
 
     return jsonify({"success": False, "message": message}), 500
+
+
+@app.route("/api/b2/status", methods=["GET"])
+def b2_status_route():
+    """Retorna el estado de conexión con Backblaze B2 y el último archivo subido."""
+    status = b2_service.get_b2_status()
+    config = load_config()
+    status["b2_last_upload"] = config.get("b2_last_upload")
+    status["b2_file"] = config.get("b2_file")
+    status["b2_status"] = config.get("b2_status", "unknown")
+    return jsonify({"success": True, **status})
 
 
 @app.route("/api/backup/validate", methods=["POST"])

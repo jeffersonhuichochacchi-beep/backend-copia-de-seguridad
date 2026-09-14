@@ -1,14 +1,18 @@
 {
     "backup_interval_minutes": null,
-    "last_backup_time": null,
-    "backup_size": 0,
-    "backup_filename": "neondb_backup",
+    "last_backup_time": "2026-09-14T17:22:05.317826",
+    "backup_size": 3225,
+    "backup_filename": "tienda_backup",
     "backup_database": "neondb",
     "current_database": "neondb",
-    "backup_file": "D:\\BACKUP\\neondb_backup.sql",
+    "backup_file": "D:\\BACKUP\\tienda_backup.sql",
     "backup_interval_seconds": 10,
     "backup_interval_hours": null,
     "backup_interval_days": null,
     "backup_interval_weeks": null,
-    "last_restore_time": null
+    "last_restore_time": null,
+    "b2_last_upload": "2026-09-14T17:22:06.221169",
+    "b2_file": "tienda_backup.sql",
+    "b2_file_id": "4_zfc9c5e78955ea21cad000b11_f110ced98fcfb028c_d20260914_m222148_c005_v0501048_t0020_u01789424508733",
+    "b2_status": "ok"
 }
