@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime
 import json
 import threading
-import b2_service
+import r2_service as b2_service  # Cloudflare R2 (S3-compatible) – alias para compatibilidad
 
 app = Flask(__name__)
 CORS(app)
@@ -388,7 +388,7 @@ def generate_native_sql_dump(backup_file: Path, temp_file: Path) -> bool:
 
 
 def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
-    """Realizar backup contra Neon.tech, guardarlo localmente y subirlo a Backblaze B2."""
+    """Realizar backup contra Neon.tech, guardarlo localmente y subirlo a Cloudflare R2."""
     backup_filename = normalize_backup_filename(filename)
     backup_file = get_backup_path(backup_filename)
     temp_file = backup_file.with_name(f"{backup_file.stem}.tmp.sql")
@@ -453,26 +453,25 @@ def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
         config["backup_database"] = DB_CONFIG["database"]
         config["current_database"] = DB_CONFIG["database"]
 
-        # Subir a Backblaze B2 en hilo separado para no bloquear el scheduler
+        # Subir a Cloudflare R2 en hilo separado para no bloquear el scheduler
         def _upload_to_b2():
             try:
                 result = b2_service.upload_file_to_b2(
                     local_path=str(backup_file),
-                    remote_filename=f"{backup_filename}.sql",
+                    # remote_filename se ignora; r2_service usa siempre 'backup.sql'
                 )
-                config["b2_last_upload"] = result["upload_time"]
-                config["b2_file"] = result["file_name"]
-                config["b2_file_id"] = result["file_id"]
-                config["b2_status"] = "ok"
+                config["r2_last_upload"] = result["upload_time"]
+                config["r2_file"] = result["file_name"]
+                config["r2_status"] = "ok"
                 save_config(config)
                 print(
-                    f"[B2] Backup subido a Backblaze B2: {result['file_name']} "
+                    f"[R2] Backup subido a Cloudflare R2: {result['file_name']} "
                     f"({result['size']} bytes)"
                 )
             except Exception as b2_err:
-                config["b2_status"] = f"error: {b2_err}"
+                config["r2_status"] = f"error: {b2_err}"
                 save_config(config)
-                print(f"[B2] Error al subir a Backblaze B2: {b2_err}")
+                print(f"[R2] Error al subir a Cloudflare R2: {b2_err}")
 
         save_config(config)
         threading.Thread(target=_upload_to_b2, daemon=True).start()
@@ -493,7 +492,7 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
     """Restaurar un backup en Neon.tech.
 
     Proceso:
-    1. Si from_b2=True o el archivo local no existe, descarga la última copia de Backblaze B2.
+    1. Si from_b2=True o el archivo local no existe, descarga 'backup.sql' desde Cloudflare R2.
     2. Hace TRUNCATE de todas las tablas existentes (CASCADE).
     3. Ejecuta el SQL del backup con psql contra Neon.tech.
     """
@@ -503,23 +502,22 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
     )
     backup_file = get_backup_path(backup_filename)
     target_database = DB_CONFIG["database"]
-    b2_filename = f"{backup_filename}.sql"
 
-    # ── Intentar descargar desde Backblaze B2 si se solicita o no hay copia local ──
+    # ── Intentar descargar desde Cloudflare R2 si se solicita o no hay copia local ──
     if from_b2 or not backup_file.exists():
-        print(f"[B2] Descargando '{b2_filename}' desde Backblaze B2...")
+        print("[R2] Descargando 'backup.sql' desde Cloudflare R2...")
         try:
             b2_service.download_file_from_b2(
-                remote_filename=b2_filename,
+                remote_filename="backup.sql",  # nombre fijo en R2
                 target_path=str(backup_file),
             )
-            print(f"[B2] Descarga completada: {backup_file}")
+            print(f"[R2] Descarga completada: {backup_file}")
         except Exception as b2_err:
             if not backup_file.exists():
                 return False, (
-                    f"❌ No se encontró el backup en Backblaze B2 ni en local: {b2_err}"
+                    f"❌ No se encontró el backup en Cloudflare R2 ni en local: {b2_err}"
                 )
-            print(f"[B2] Advertencia: no se pudo descargar desde B2, usando copia local. {b2_err}")
+            print(f"[R2] Advertencia: no se pudo descargar desde R2, usando copia local. {b2_err}")
 
     # ── Validar archivo local ──
     if not backup_file.exists():
@@ -698,7 +696,7 @@ def start_scheduler(interval_minutes=None, interval_seconds=None, interval_hours
 
     print(
         f"Scheduler iniciado: backup cada {interval_value} {interval_type} -> "
-        f"{get_backup_path(backup_filename)} + Backblaze B2"
+        f"{get_backup_path(backup_filename)} + Cloudflare R2"
     )
     return True
 
@@ -1130,12 +1128,12 @@ def restore_backup_route():
 
 @app.route("/api/b2/status", methods=["GET"])
 def b2_status_route():
-    """Retorna el estado de conexión con Backblaze B2 y el último archivo subido."""
+    """Retorna el estado de conexión con Cloudflare R2 y el último archivo subido."""
     status = b2_service.get_b2_status()
     config = load_config()
-    status["b2_last_upload"] = config.get("b2_last_upload")
-    status["b2_file"] = config.get("b2_file")
-    status["b2_status"] = config.get("b2_status", "unknown")
+    status["r2_last_upload"] = config.get("r2_last_upload")
+    status["r2_file"] = config.get("r2_file")
+    status["r2_status"] = config.get("r2_status", "unknown")
     return jsonify({"success": True, **status})
 
 
