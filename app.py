@@ -488,13 +488,63 @@ def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
         return False, str(e)
 
 
+def _ensure_database_exists(target_database: str) -> tuple[bool, str]:
+    """
+    Verifica si la base de datos existe en Neon.tech usando el endpoint directo
+    (sin pooler) para evitar falsos positivos de conexiones obsoletas.
+    Si no existe, la crea conectándose a la base 'postgres'.
+    Retorna (True, mensaje) o (False, error).
+    """
+    # El endpoint directo (sin "-pooler") reporta el estado real de la BD
+    direct_host = DB_CONFIG["host"].replace("-pooler", "")
+
+    def _connect_direct(database):
+        return psycopg2.connect(
+            host=direct_host,
+            database=database,
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            port=DB_CONFIG["port"],
+            sslmode=DB_CONFIG.get("sslmode", "require"),
+            connect_timeout=10,
+        )
+
+    # 1. Verificar si la base existe via endpoint directo
+    try:
+        conn = _connect_direct(target_database)
+        conn.close()
+        print(f"[DB] Base de datos '{target_database}' ya existe.")
+        return True, "exists"
+    except psycopg2.OperationalError as e:
+        if "does not exist" not in str(e):
+            # Error distinto (SSL, red...) — intentar continuar igualmente
+            print(f"[DB] No se pudo verificar '{target_database}' ({e}). Intentando crear...")
+
+    # 2. La base no existe → crearla desde 'postgres' via endpoint directo
+    print(f"[DB] Base de datos '{target_database}' no existe. Creándola...")
+    try:
+        conn_pg = _connect_direct("postgres")
+        conn_pg.autocommit = True
+        cur = conn_pg.cursor()
+        cur.execute(
+            f'CREATE DATABASE "{target_database}" OWNER "{DB_CONFIG["user"]}";'
+        )
+        cur.close()
+        conn_pg.close()
+        print(f"[DB] Base de datos '{target_database}' creada exitosamente.")
+        return True, "created"
+    except Exception as e:
+        return False, f"No se pudo crear la base de datos '{target_database}': {e}"
+
+
 def restore_backup(filename=None, new_database_name=None, from_b2=False):
     """Restaurar un backup en Neon.tech.
 
     Proceso:
-    1. Si from_b2=True o el archivo local no existe, descarga 'backup.sql' desde Cloudflare R2.
-    2. Hace TRUNCATE de todas las tablas existentes (CASCADE).
-    3. Ejecuta el SQL del backup con psql contra Neon.tech.
+    1. Descarga el backup desde Cloudflare R2 si se solicita o no hay copia local.
+    2. Si la base de datos no existe en Neon, la crea automáticamente.
+    3. Hace TRUNCATE de todas las tablas existentes (CASCADE) si las hay.
+    4. Ejecuta el SQL del backup con psql contra Neon.tech.
     """
     config = load_config()
     backup_filename = normalize_backup_filename(
@@ -503,12 +553,13 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
     backup_file = get_backup_path(backup_filename)
     target_database = DB_CONFIG["database"]
 
-    # ── Intentar descargar desde Cloudflare R2 si se solicita o no hay copia local ──
+    # ── Paso 1: Descargar desde Cloudflare R2 si se solicita o no hay copia local ──
     if from_b2 or not backup_file.exists():
-        print("[R2] Descargando 'backup.sql' desde Cloudflare R2...")
+        r2_filename = f"{backup_filename}.sql"
+        print(f"[R2] Descargando '{r2_filename}' desde Cloudflare R2...")
         try:
             b2_service.download_file_from_b2(
-                remote_filename="backup.sql",  # nombre fijo en R2
+                remote_filename=r2_filename,
                 target_path=str(backup_file),
             )
             print(f"[R2] Descarga completada: {backup_file}")
@@ -539,40 +590,52 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
     try:
         psql_path = find_postgres_tool("psql")
 
-        # ── Paso 1: Truncar tablas ──
-        print(f"[DEBUG] Truncando tablas en Neon.tech ({target_database})...")
-        conn = get_db_connection()
-        if not conn:
-            return False, "No se pudo conectar a Neon.tech para truncar las tablas."
+        # ── Paso 2: Asegurar que la base de datos existe (crearla si no existe) ──
+        ok, db_msg = _ensure_database_exists(target_database)
+        if not ok:
+            return False, f"❌ {db_msg}"
 
-        conn.autocommit = True
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT tablename FROM pg_tables
-            WHERE schemaname = 'public'
-            ORDER BY tablename;
-            """
-        )
-        tables = [row[0] for row in cur.fetchall()]
-        if tables:
-            tables_sql = ", ".join(f'"{t}"' for t in tables)
-            cur.execute(f"TRUNCATE TABLE {tables_sql} RESTART IDENTITY CASCADE;")
-            print(f"[DEBUG] Tablas truncadas: {tables}")
-        cur.close()
-        conn.close()
+        # ── Paso 3: Truncar tablas existentes (tolerante a fallos de conexión) ──
+        try:
+            conn = get_db_connection(target_database)
+            if conn:
+                print(f"[DEBUG] Verificando tablas en '{target_database}'...")
+                conn.autocommit = True
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT tablename FROM pg_tables
+                    WHERE schemaname = 'public'
+                    ORDER BY tablename;
+                    """
+                )
+                tables = [row[0] for row in cur.fetchall()]
+                if tables:
+                    tables_sql = ", ".join(f'"{t}"' for t in tables)
+                    cur.execute(f"TRUNCATE TABLE {tables_sql} RESTART IDENTITY CASCADE;")
+                    print(f"[DEBUG] Tablas truncadas: {tables}")
+                else:
+                    print("[DEBUG] No hay tablas existentes, se restaurará desde cero.")
+                cur.close()
+                conn.close()
+            else:
+                print("[WARN] No se pudo conectar para truncar tablas. Continuando con restore...")
+        except Exception as trunc_err:
+            print(f"[WARN] No se pudo truncar tablas ({trunc_err}). Continuando con restore...")
 
-        # ── Paso 2: Restaurar con psql ──
+        # ── Paso 4: Restaurar con psql (usa host directo sin pooler para mayor estabilidad) ──
+        # Neon permite conectar al endpoint sin "-pooler" para operaciones largas
+        neon_host_direct = DB_CONFIG["host"].replace("-pooler", "")
         command = [
             psql_path,
-            "-h", DB_CONFIG["host"],
+            "-h", neon_host_direct,
             "-p", str(DB_CONFIG["port"]),
             "-U", DB_CONFIG["user"],
             "-d", target_database,
             "-v", "ON_ERROR_STOP=0",
             "-f", str(backup_file),
         ]
-        print(f"[DEBUG] Restaurando {backup_file} en Neon.tech ({target_database})")
+        print(f"[DEBUG] Restaurando {backup_file} en Neon.tech ({target_database}) via {neon_host_direct}")
         result = subprocess.run(
             command,
             env=postgres_env(),
