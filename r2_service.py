@@ -23,9 +23,6 @@ R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "dbdcf61a57b8703f9d8354
 R2_BUCKET_NAME       = os.getenv("R2_BUCKET_NAME",       "backups-db")
 R2_ENDPOINT_URL      = os.getenv("R2_ENDPOINT_URL",      "https://4288972a799d4e0b15cc80ace51e84e4.r2.cloudflarestorage.com")
 
-# Nombre fijo del objeto en R2 — se sobreescribe en cada backup
-FIXED_REMOTE_NAME = "backup.sql"
-
 # Cliente global reutilizable
 _s3_client = None
 
@@ -52,12 +49,14 @@ def upload_file_to_b2(local_path: str, remote_filename: str = None) -> dict:
     """
     Sube un archivo local al bucket de Cloudflare R2.
 
-    Siempre usa el nombre fijo FIXED_REMOTE_NAME ('backup.sql') para
-    sobreescribir el objeto anterior y mantener un único archivo actualizado.
+    Usa remote_filename como nombre del objeto en R2. Si ya existe un objeto
+    con ese nombre, lo sobreescribe automáticamente (sin acumular versiones).
+    Si remote_filename es None, usa el nombre del archivo local.
 
     Args:
         local_path: Ruta local del archivo a subir.
-        remote_filename: Ignorado; se usa siempre FIXED_REMOTE_NAME.
+        remote_filename: Nombre del objeto en R2 (ej. 'neondb_backup.sql').
+                         Si None, usa el basename del archivo local.
 
     Returns:
         dict con {file_name, file_id, size, upload_time, bucket}
@@ -65,7 +64,8 @@ def upload_file_to_b2(local_path: str, remote_filename: str = None) -> dict:
     if not os.path.exists(local_path):
         raise FileNotFoundError(f"El archivo local no existe: {local_path}")
 
-    key = FIXED_REMOTE_NAME  # nombre fijo en R2
+    # Usar el nombre configurado; si no se pasa, el basename del archivo local
+    key = remote_filename if remote_filename else os.path.basename(local_path)
     client = _get_r2_client()
 
     client.upload_file(
@@ -90,16 +90,14 @@ def download_file_from_b2(remote_filename: str, target_path: str) -> dict:
     """
     Descarga el backup desde Cloudflare R2 a una ruta local.
 
-    Siempre descarga el objeto con nombre fijo FIXED_REMOTE_NAME.
-
     Args:
-        remote_filename: Ignorado; se usa siempre FIXED_REMOTE_NAME.
+        remote_filename: Nombre del objeto en R2 (ej. 'neondb_backup.sql').
         target_path: Ruta local donde guardar el archivo.
 
     Returns:
         dict con {file_name, target_path, size, download_time}
     """
-    key = FIXED_REMOTE_NAME
+    key = remote_filename
     client = _get_r2_client()
 
     try:
@@ -127,15 +125,17 @@ def download_file_from_b2(remote_filename: str, target_path: str) -> dict:
 
 def get_b2_file_info(remote_filename: str = None) -> dict | None:
     """
-    Obtiene información del objeto fijo en R2.
+    Obtiene información de un objeto en R2.
 
     Args:
-        remote_filename: Ignorado; siempre consulta FIXED_REMOTE_NAME.
+        remote_filename: Nombre del objeto en R2. Si None, no hace nada.
 
     Returns:
         dict con info del archivo, o None si no existe.
     """
-    key = FIXED_REMOTE_NAME
+    if not remote_filename:
+        return None
+    key = remote_filename
     try:
         client = _get_r2_client()
         resp = client.head_object(Bucket=R2_BUCKET_NAME, Key=key)

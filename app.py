@@ -458,7 +458,7 @@ def perform_backup(filename=DEFAULT_BACKUP_FILENAME):
             try:
                 result = b2_service.upload_file_to_b2(
                     local_path=str(backup_file),
-                    # remote_filename se ignora; r2_service usa siempre 'backup.sql'
+                    remote_filename=f"{backup_filename}.sql",  # nombre real configurado
                 )
                 config["r2_last_upload"] = result["upload_time"]
                 config["r2_file"] = result["file_name"]

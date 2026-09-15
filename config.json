@@ -1,17 +1,17 @@
 {
     "backup_interval_minutes": null,
-    "last_backup_time": "2026-09-15T14:08:50.786283",
+    "last_backup_time": "2026-09-15T14:14:10.827400",
     "backup_size": 3225,
-    "backup_filename": "neondb_backup",
+    "backup_filename": "productodb_backup",
     "backup_database": "neondb",
     "current_database": "neondb",
-    "backup_file": "D:\\BACKUP\\neondb_backup.sql",
-    "backup_interval_seconds": 10,
+    "backup_file": "D:\\BACKUP\\productodb_backup.sql",
+    "backup_interval_seconds": 20,
     "backup_interval_hours": null,
     "backup_interval_days": null,
     "backup_interval_weeks": null,
     "last_restore_time": null,
-    "r2_last_upload": "2026-09-15T14:08:51.771585",
-    "r2_file": "backup.sql",
+    "r2_last_upload": "2026-09-15T14:14:11.748330",
+    "r2_file": "producto_db_backup.sql",
     "r2_status": "ok"
 }
