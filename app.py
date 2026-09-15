@@ -79,7 +79,8 @@ def save_database_name(database_name):
 # CREDENCIALES NEON.TECH (CLOUD)
 # ===========================
 NEON_HOST = "ep-delicate-term-b4zszln3-pooler.c-6.us-east-2.aws.neon.tech"
-NEON_DATABASE = "neondb"
+_initial_config = load_config()
+NEON_DATABASE = _initial_config.get("current_database") or _initial_config.get("backup_database") or "producto_db_backup"
 NEON_USER = "neondb_owner"
 NEON_PASSWORD = "npg_je9vgbuEIcJ5"
 NEON_PORT = 5432
@@ -211,29 +212,53 @@ def get_database_info():
 
 
 def get_available_databases():
-    """Obtener lista de bases de datos disponibles.
-    En Neon.tech (cloud) solo existe la base de datos configurada.
-    """
-    # Neon.tech es una BD gestionada: no se permite conectar a 'postgres'
-    # ni crear/listar otras bases de datos. Solo existe neondb.
-    return [DB_CONFIG["database"]]
+    """Obtener lista de bases de datos disponibles en Neon.tech."""
+    try:
+        direct_host = DB_CONFIG["host"].replace("-pooler", "")
+        conn = psycopg2.connect(
+            host=direct_host,
+            database="postgres",
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            port=DB_CONFIG["port"],
+            sslmode=DB_CONFIG.get("sslmode", "require"),
+            connect_timeout=10,
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;")
+        dbs = [r[0] for r in cur.fetchall() if r[0] not in ("postgres",)]
+        cur.close()
+        conn.close()
+        if dbs:
+            return dbs
+    except Exception as e:
+        print(f"Error listando bases de datos en Neon: {e}")
+    current_db = load_config().get("current_database") or DB_CONFIG["database"]
+    return [current_db]
 
 
 def switch_database(new_database_name):
-    """Cambiar a una base de datos diferente.
-    En Neon.tech solo existe una base de datos (neondb).
-    """
-    neon_db = DB_CONFIG["database"]
-    if new_database_name != neon_db:
-        return False, (
-            f"En Neon.tech solo está disponible la base de datos '{neon_db}'. "
-            f"No se puede cambiar a '{new_database_name}'."
+    """Cambiar a una base de datos diferente en Neon.tech."""
+    try:
+        direct_host = DB_CONFIG["host"].replace("-pooler", "")
+        conn = psycopg2.connect(
+            host=direct_host,
+            database=new_database_name,
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            port=DB_CONFIG["port"],
+            sslmode=DB_CONFIG.get("sslmode", "require"),
+            connect_timeout=10,
         )
-    # Ya estamos en la única BD disponible
-    config = load_config()
-    config["current_database"] = neon_db
-    save_config(config)
-    return True, f"Base de datos activa: '{neon_db}'"
+        conn.close()
+        DB_CONFIG["database"] = new_database_name
+        config = load_config()
+        config["current_database"] = new_database_name
+        config["backup_database"] = new_database_name
+        save_config(config)
+        return True, f"Base de datos activa: '{new_database_name}'"
+    except Exception as e:
+        return False, f"No se pudo conectar a '{new_database_name}': {e}"
 
 
 # ===========================
@@ -551,7 +576,17 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
         filename or config.get("backup_filename") or DEFAULT_BACKUP_FILENAME
     )
     backup_file = get_backup_path(backup_filename)
-    target_database = DB_CONFIG["database"]
+
+    # Determinar nombre de la base de datos destino:
+    # 1. new_database_name si fue proporcionado
+    # 2. El nombre del propio backup (ej: 'producto_db_backup') para que coincida
+    # 3. O la base de datos actual configurada
+    target_database = (
+        new_database_name
+        or backup_filename
+        or config.get("current_database")
+        or DB_CONFIG["database"]
+    )
 
     # ── Paso 1: Descargar desde Cloudflare R2 si se solicita o no hay copia local ──
     if from_b2 or not backup_file.exists():
@@ -647,7 +682,9 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
             print(f"Error en restauracion: {error_message}")
             return False, error_message
 
+        DB_CONFIG["database"] = target_database
         config["current_database"] = target_database
+        config["backup_database"] = target_database
         config["backup_filename"] = backup_filename
         config["backup_file"] = str(backup_file)
         config["last_restore_time"] = datetime.now().isoformat()
