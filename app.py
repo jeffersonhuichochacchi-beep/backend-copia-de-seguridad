@@ -173,7 +173,13 @@ def get_db_connection(database=None):
 def get_database_info():
     """Obtener informacion de la base de datos configurada."""
     try:
-        conn = get_db_connection()
+        current_db = load_config().get("current_database") or DB_CONFIG["database"]
+        # Verificar primero si la base de datos realmente existe en Neon
+        dbs = get_available_databases()
+        if not dbs or current_db not in dbs:
+            return None
+
+        conn = get_db_connection(current_db)
         if not conn:
             return None
 
@@ -205,6 +211,7 @@ def get_database_info():
         return {
             "tables": tables,
             "stats": stats,
+            "database_name": current_db,
         }
     except Exception as e:
         print(f"Error obteniendo informacion de la BD: {e}")
@@ -229,12 +236,10 @@ def get_available_databases():
         dbs = [r[0] for r in cur.fetchall() if r[0] not in ("postgres",)]
         cur.close()
         conn.close()
-        if dbs:
-            return dbs
+        return dbs
     except Exception as e:
         print(f"Error listando bases de datos en Neon: {e}")
-    current_db = load_config().get("current_database") or DB_CONFIG["database"]
-    return [current_db]
+        return []
 
 
 def switch_database(new_database_name):
@@ -849,19 +854,18 @@ def database_info():
                 "success": True,
                 "tables": info["tables"],
                 "stats": info["stats"],
-                "database_name": DB_CONFIG["database"],
+                "database_name": info["database_name"],
             }
         )
 
-    return (
-        jsonify(
-            {
-                "success": False,
-                "message": "Error al obtener informacion de la base de datos",
-                "database_name": DB_CONFIG["database"],
-            }
-        ),
-        500,
+    return jsonify(
+        {
+            "success": False,
+            "message": "No hay base de datos conectada",
+            "database_name": None,
+            "tables": [],
+            "stats": {},
+        }
     )
 
 
@@ -869,11 +873,14 @@ def database_info():
 def list_databases():
     """Listar todas las bases de datos disponibles en PostgreSQL."""
     databases = get_available_databases()
+    current_db = load_config().get("current_database") or DB_CONFIG["database"]
+    if current_db not in databases:
+        current_db = databases[0] if databases else None
     return jsonify(
         {
             "success": True,
             "databases": databases,
-            "current_database": DB_CONFIG["database"],
+            "current_database": current_db,
         }
     )
 

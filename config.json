@@ -10,7 +10,7 @@
     "backup_interval_hours": null,
     "backup_interval_days": null,
     "backup_interval_weeks": null,
-    "last_restore_time": "2026-09-15T14:55:50.008626",
+    "last_restore_time": "2026-09-15T15:03:45.843124",
     "r2_last_upload": "2026-09-15T14:18:32.841022",
     "r2_file": "producto_db_backup.sql",
     "r2_status": "ok"
