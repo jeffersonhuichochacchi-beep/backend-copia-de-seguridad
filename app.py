@@ -913,6 +913,71 @@ def switch_database_route():
     return jsonify({"success": False, "message": message}), 500
 
 
+@app.route("/api/table/data", methods=["GET"])
+def get_table_data():
+    table_name = request.args.get("table", "").strip()
+    if not table_name:
+        return jsonify({"success": False, "message": "Nombre de tabla requerido"}), 400
+
+    if not re.match(r"^[a-zA-Z0-9_]+$", table_name):
+        return jsonify({"success": False, "message": "Nombre de tabla inválido"}), 400
+
+    current_db = load_config().get("current_database") or DB_CONFIG["database"]
+    dbs = get_available_databases()
+    if not dbs or current_db not in dbs:
+        return jsonify({"success": False, "message": "No hay base de datos disponible"}), 404
+
+    conn = get_db_connection(current_db)
+    if not conn:
+        return jsonify({"success": False, "message": "No se pudo conectar a la base de datos"}), 500
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_schema = 'public' AND table_name = %s;
+            """,
+            (table_name,)
+        )
+        if not cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"success": False, "message": f"Tabla '{table_name}' no encontrada"}), 404
+
+        cur.execute(sql.SQL("SELECT * FROM {} LIMIT 200;").format(sql.Identifier(table_name)))
+        columns = [desc[0] for desc in cur.description] if cur.description else []
+        rows = cur.fetchall()
+
+        formatted_rows = []
+        for row in rows:
+            formatted_row = []
+            for val in row:
+                if val is None:
+                    formatted_row.append(None)
+                elif hasattr(val, "isoformat"):
+                    formatted_row.append(val.isoformat())
+                elif hasattr(val, "__float__") or hasattr(val, "__int__"):
+                    formatted_row.append(str(val) if not isinstance(val, (int, float)) else val)
+                else:
+                    formatted_row.append(str(val))
+            formatted_rows.append(formatted_row)
+
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "success": True,
+            "table": table_name,
+            "columns": columns,
+            "rows": formatted_rows,
+            "total": len(formatted_rows),
+        })
+    except Exception as e:
+        print(f"Error al obtener datos de tabla {table_name}: {e}")
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
 @app.route("/api/scheduler/status", methods=["GET"])
 def scheduler_status():
     config = load_config()

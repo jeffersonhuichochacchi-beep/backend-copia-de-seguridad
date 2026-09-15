@@ -1,7 +1,7 @@
 {
     "backup_interval_minutes": null,
-    "last_backup_time": "2026-09-15T14:18:31.259709",
-    "backup_size": 3225,
+    "last_backup_time": "2026-09-15T15:04:48.556083",
+    "backup_size": 3237,
     "backup_filename": "producto_db_backup",
     "backup_database": "producto_db_backup",
     "current_database": "producto_db_backup",
@@ -10,8 +10,8 @@
     "backup_interval_hours": null,
     "backup_interval_days": null,
     "backup_interval_weeks": null,
-    "last_restore_time": "2026-09-15T15:03:45.843124",
-    "r2_last_upload": "2026-09-15T14:18:32.841022",
+    "last_restore_time": "2026-09-15T15:05:27.901992",
+    "r2_last_upload": "2026-09-15T15:04:49.606838",
     "r2_file": "producto_db_backup.sql",
     "r2_status": "ok"
 }
