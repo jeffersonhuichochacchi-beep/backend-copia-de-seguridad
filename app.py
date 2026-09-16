@@ -11,23 +11,40 @@ from pathlib import Path
 from datetime import datetime
 import json
 import threading
+from urllib.parse import urlparse
+from dotenv import load_dotenv
 import r2_service as b2_service  # Cloudflare R2 (S3-compatible) – alias para compatibilidad
 
+# Cargar .env si existe en el directorio local
+_BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(_BASE_DIR / ".env")
+
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ===========================
 # CONFIGURACION
 # ===========================
 
 BASE_DIR = Path(__file__).resolve().parent
-BACKUP_DIR = Path(r"D:\BACKUP")  # Tus backups están en D:\BACKUP
+
+# Ruta de backups multiplataforma:
+# 1. Variable de entorno BACKUP_DIR (si se especifica)
+# 2. Si está en Windows y existe D:\BACKUP, usa D:\BACKUP (entorno local intacto)
+# 3. En caso contrario (Linux, Render, contenedores), usa BASE_DIR / "backups"
+_env_backup_dir = os.environ.get("BACKUP_DIR")
+if _env_backup_dir:
+    BACKUP_DIR = Path(_env_backup_dir)
+elif os.name == "nt" and Path(r"D:\BACKUP").exists():
+    BACKUP_DIR = Path(r"D:\BACKUP")
+else:
+    BACKUP_DIR = BASE_DIR / "backups"
+
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = BASE_DIR / "config.json"
 
 DEFAULT_DATABASE = "tienda_final"
 DEFAULT_BACKUP_FILENAME = "tienda_db_backup"
-
-BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_config():
@@ -78,13 +95,25 @@ def save_database_name(database_name):
 # ===========================
 # CREDENCIALES NEON.TECH (CLOUD)
 # ===========================
-NEON_HOST = "ep-delicate-term-b4zszln3-pooler.c-6.us-east-2.aws.neon.tech"
 _initial_config = load_config()
-NEON_DATABASE = _initial_config.get("current_database") or _initial_config.get("backup_database") or "producto_db_backup"
-NEON_USER = "neondb_owner"
-NEON_PASSWORD = "npg_je9vgbuEIcJ5"
-NEON_PORT = 5432
-NEON_SSLMODE = "require"
+_database_url = os.environ.get("DATABASE_URL")
+
+if _database_url:
+    _parsed = urlparse(_database_url)
+    NEON_HOST = _parsed.hostname or "ep-delicate-term-b4zszln3-pooler.c-6.us-east-2.aws.neon.tech"
+    NEON_PORT = _parsed.port or 5432
+    NEON_USER = _parsed.username or "neondb_owner"
+    NEON_PASSWORD = _parsed.password or "npg_je9vgbuEIcJ5"
+    _db_path = (_parsed.path or "").lstrip("/")
+    NEON_DATABASE = _db_path if _db_path else (_initial_config.get("current_database") or _initial_config.get("backup_database") or "producto_db_backup")
+    NEON_SSLMODE = "require"
+else:
+    NEON_HOST = os.environ.get("NEON_HOST", "ep-delicate-term-b4zszln3-pooler.c-6.us-east-2.aws.neon.tech")
+    NEON_DATABASE = os.environ.get("NEON_DATABASE", _initial_config.get("current_database") or _initial_config.get("backup_database") or "producto_db_backup")
+    NEON_USER = os.environ.get("NEON_USER", "neondb_owner")
+    NEON_PASSWORD = os.environ.get("NEON_PASSWORD", "npg_je9vgbuEIcJ5")
+    NEON_PORT = int(os.environ.get("NEON_PORT", 5432))
+    NEON_SSLMODE = os.environ.get("NEON_SSLMODE", "require")
 
 DB_CONFIG = {
     "host": NEON_HOST,
@@ -94,6 +123,26 @@ DB_CONFIG = {
     "port": NEON_PORT,
     "sslmode": NEON_SSLMODE,
 }
+
+# ===========================
+# ENDPOINTS DE SALUD (HEALTH CHECKS)
+# ===========================
+
+@app.route("/", methods=["GET"])
+def home_check():
+    """Endpoint raíz para verificar que el servicio está activo (Render / Uptime)."""
+    return jsonify({
+        "status": "ok",
+        "service": "Sistema de Backups - Backend API",
+        "version": "1.0.0",
+        "database": DB_CONFIG.get("database", "tienda_final"),
+        "timestamp": datetime.now().isoformat()
+    }), 200
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check rápido para Render."""
+    return jsonify({"status": "healthy", "time": datetime.now().isoformat()}), 200
 
 scheduler = BackgroundScheduler()
 scheduler_running = False
@@ -628,8 +677,6 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
         return False, f"❌ Error al verificar el archivo '{backup_filename}.sql': {str(e)}"
 
     try:
-        psql_path = find_postgres_tool("psql")
-
         # ── Paso 2: Asegurar que la base de datos existe (crearla si no existe) ──
         ok, db_msg = _ensure_database_exists(target_database)
         if not ok:
@@ -663,29 +710,55 @@ def restore_backup(filename=None, new_database_name=None, from_b2=False):
         except Exception as trunc_err:
             print(f"[WARN] No se pudo truncar tablas ({trunc_err}). Continuando con restore...")
 
-        # ── Paso 4: Restaurar con psql (usa host directo sin pooler para mayor estabilidad) ──
-        # Neon permite conectar al endpoint sin "-pooler" para operaciones largas
+        # ── Paso 4: Restaurar (Intento con psql; si falla o no está instalado, restauración nativa) ──
         neon_host_direct = DB_CONFIG["host"].replace("-pooler", "")
-        command = [
-            psql_path,
-            "-h", neon_host_direct,
-            "-p", str(DB_CONFIG["port"]),
-            "-U", DB_CONFIG["user"],
-            "-d", target_database,
-            "-v", "ON_ERROR_STOP=0",
-            "-f", str(backup_file),
-        ]
-        print(f"[DEBUG] Restaurando {backup_file} en Neon.tech ({target_database}) via {neon_host_direct}")
-        result = subprocess.run(
-            command,
-            env=postgres_env(),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            error_message = result.stderr.strip() or "psql termino con error"
-            print(f"Error en restauracion: {error_message}")
-            return False, error_message
+        psql_success = False
+
+        try:
+            psql_path = find_postgres_tool("psql")
+            command = [
+                psql_path,
+                "-h", neon_host_direct,
+                "-p", str(DB_CONFIG["port"]),
+                "-U", DB_CONFIG["user"],
+                "-d", target_database,
+                "-v", "ON_ERROR_STOP=0",
+                "-f", str(backup_file),
+            ]
+            print(f"[DEBUG] Restaurando {backup_file} en Neon.tech ({target_database}) via {neon_host_direct}")
+            result = subprocess.run(
+                command,
+                env=postgres_env(),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                psql_success = True
+            else:
+                print(f"[WARN] psql terminó con advertencias/error ({result.stderr.strip()}). Intentando restauración nativa con psycopg2...")
+        except FileNotFoundError:
+            print("[INFO] psql no encontrado en el sistema. Usando restauración nativa con psycopg2...")
+
+        if not psql_success:
+            # Fallback nativo: ejecutar directamente las sentencias SQL con psycopg2
+            restore_conn = get_db_connection(target_database)
+            if not restore_conn:
+                return False, f"❌ No se pudo conectar a la base de datos '{target_database}' para la restauración."
+            try:
+                restore_conn.autocommit = True
+                with restore_conn.cursor() as cur:
+                    with open(backup_file, "r", encoding="utf-8", errors="ignore") as sql_f:
+                        sql_content = sql_f.read()
+                    cur.execute(sql_content)
+                restore_conn.close()
+                print(f"[OK] Restauración nativa completada con éxito en '{target_database}'.")
+            except Exception as native_err:
+                if restore_conn:
+                    try:
+                        restore_conn.close()
+                    except Exception:
+                        pass
+                return False, f"❌ Error en restauración nativa: {str(native_err)}"
 
         DB_CONFIG["database"] = target_database
         config["current_database"] = target_database
@@ -1548,7 +1621,25 @@ def initialize_schema():
 # INICIALIZACION
 # ===========================
 
+def _startup_init():
+    """Inicialización en segundo plano al arrancar el servidor (funciona tanto con python app.py como con gunicorn)."""
+    try:
+        conn = get_db_connection()
+        if conn:
+            print("[OK] Conexión a Neon.tech exitosa en el arranque.")
+            conn.close()
+            initialize_schema()
+        else:
+            print("[WARN] No se pudo verificar conexión inicial a Neon.tech.")
+    except Exception as e:
+        print(f"[WARN] Advertencia en inicialización de arranque: {e}")
+
+# Ejecutar verificación de esquema en segundo plano sin demorar el arranque del servidor
+threading.Thread(target=_startup_init, daemon=True).start()
+
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    debug_mode = os.environ.get("FLASK_DEBUG", "false").lower() in ("true", "1")
     print("=" * 60)
     print("Sistema de Backups Automaticos - Neon.tech (Cloud)")
     print("=" * 60)
@@ -1557,23 +1648,7 @@ if __name__ == "__main__":
     print(f"Usuario:        {DB_CONFIG['user']}")
     print(f"SSL:            {DB_CONFIG.get('sslmode', 'require')}")
     print(f"Backups en:     {BACKUP_DIR}")
-    print("Servidor Flask: http://localhost:5000")
+    print(f"Servidor Flask: http://0.0.0.0:{port}")
     print("=" * 60)
 
-    # Verificar conexion a Neon.tech
-    conn = get_db_connection()
-    if conn:
-        print("[OK] Conexion a Neon.tech exitosa")
-        conn.close()
-
-        # Inicializar esquema (crea tablas e inserta datos si es la primera vez)
-        initialize_schema()
-    else:
-        print("[ERROR] Error al conectar con Neon.tech")
-        print("Verifica tu conexion a internet y las credenciales.")
-
-    print("=" * 60)
-    print("Presiona Ctrl+C para detener el servidor")
-    print("=" * 60)
-
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=debug_mode, host="0.0.0.0", port=port)
